@@ -1,9 +1,11 @@
-import os
-import json
-import signal
-import logging
-import threading
-import time
+# app.py
+# Root API: https://binkhoale1812-poptech-cleaner.hf.space/
+# Usages: 
+## https://binkhoale1812-poptech-cleaner.hf.space/fetch?Password=...
+## https://binkhoale1812-poptech-cleaner.hf.space/load?Password=...
+## https://binkhoale1812-poptech-cleaner.hf.space/delete?Password=...
+
+import os, json, signal, logging, threading, time
 from datetime import datetime, timedelta
 from queue import Queue, Empty
 
@@ -14,267 +16,205 @@ import numpy as np
 from sklearn.impute import KNNImputer
 from sklearn.linear_model import LinearRegression
 from pymongo import MongoClient, errors as mongo_errors
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+import uvicorn
 
-# ─────────────────────────  ENV / CONFIG  ──────────────────────────
-load_dotenv()  # reads .env in container root
+# ─────── ENV CONFIG ───────
+load_dotenv()
 
-# Topic and APIs
-BROKER      = os.getenv("BROKER")
-PORT        = int(os.getenv("PORT", 1883))
-USERNAME    = os.getenv("USERNAME")
-PASSWORD    = os.getenv("PASSWORD")
-MQTT_TOPIC  = os.getenv("MQTT_TOPIC", "device/socket/reply/#")
+BROKER       = os.getenv("BROKER")
+PORT         = int(os.getenv("PORT", 1883))
+USERNAME     = os.getenv("USERNAME")
+PASSWORD     = os.getenv("PASSWORD")
+MQTT_TOPIC   = os.getenv("MQTT_TOPIC", "device/socket/reply/#")
 
-# Mongo string
-MONGO_URI   = os.getenv("MONGO_URI")
-MONGO_DB    = os.getenv("MONGO_DB", "poptech")
-MONGO_COL   = os.getenv("MONGO_COLLECTION", "device_clean")
+MONGO_URI    = os.getenv("MONGO_URI")
+MONGO_DB     = os.getenv("MONGO_DB", "poptech")
+MONGO_COL    = os.getenv("MONGO_COLLECTION", "device_clean")
+FETCH_PASS   = os.getenv("FETCH_PASSWORD")
 
-# Prediction and cleaning prefixes
-BATCH_SECONDS          = int(os.getenv("WINDOW_SECONDS", 3600))      # 1 h default (suggesting ~15-30m on session saver on deployment stage)
-EXPECTED_INTERVAL_SEC  = int(os.getenv("EXPECTED_INTERVAL_SEC", 30))
-TOLERANCE_SEC          = int(os.getenv("TOLERANCE_SEC", 2))
-
-# Write checkpoint file as cacheable
+BATCH_SECONDS = int(os.getenv("WINDOW_SECONDS", 1800))
+EXPECTED_INTERVAL_SEC = int(os.getenv("EXPECTED_INTERVAL_SEC", 30))
+TOLERANCE_SEC = int(os.getenv("TOLERANCE_SEC", 2))
 RAW_CHECKPOINT_PATH = os.getenv("RAW_CHECKPOINT_PATH", "cache/checkpoint_raw.csv")
+EXPORT_CSV_PATH = "mongo_cleaned_export.csv"
+
 os.makedirs(os.path.dirname(RAW_CHECKPOINT_PATH), exist_ok=True)
 
-# ─────────────────────────  LOGGING  ───────────────────────────────
+# ─────── LOGGING ───────
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    force=True,
+    force=True
 )
 logger = logging.getLogger("poptech-cleaner")
-for m in ["pymongo", "pymongo.server_selection",
-          "pymongo.topology", "pymongo.connection"]:
+for m in ["pymongo", "pymongo.server_selection", "pymongo.topology", "pymongo.connection"]:
     logging.getLogger(m).setLevel(logging.WARNING)
-logger.info("🚀 Starting PopTech Electrical Cleaning Pipeline...")
+logger.info("🚀 PopTech FastAPI Cleaning Server starting...")
 
-# ─────────────────────────  GLOBALS  ───────────────────────────────
-queue_raw   = Queue()        # MQTT → queue → batch thread
-stop_event  = threading.Event()
+# ──────────── GLOBALS ─────────────────
+queue_raw = Queue()
+stop_event = threading.Event()
+app = FastAPI()
 
-
-# ────────────────────────  MQTT CALLBACKS  ─────────────────────────
+# ─────────── MQTT CALLBACKS ───────────
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         logger.info("✅ Connected to MQTT broker")
-        client.subscribe(MQTT_TOPIC, qos=0)
+        client.subscribe(MQTT_TOPIC)
     else:
-        logger.error(f"❌ MQTT connection failed with code {rc}")
+        logger.error(f"❌ MQTT connection failed: {rc}")
 
-
+# ─ DEBUG MESSENGER & CHECKPOINT WRITER ─
 def on_message(client, userdata, msg):
-    """Push raw line (timestamp, topic, payload) onto in-memory queue + CSV checkpoint"""
     ts = datetime.utcnow().isoformat()
     payload = msg.payload.decode(errors="replace")
-    row_dict = {"timestamp": ts, "topic": msg.topic, "payload": payload}
-    queue_raw.put(row_dict)
+    queue_raw.put({"timestamp": ts, "topic": msg.topic, "payload": payload})
 
-    # Log every received message (even before parsing)
     try:
         data = json.loads(payload.replace('""', '"')).get("data", [])
-        voltage = data[0] if len(data) > 0 else None
-        current = data[1] if len(data) > 1 else None
-        power   = data[2] if len(data) > 2 else None
-        consume = data[3] if len(data) > 3 else None
-        logger.info(f"📩 MQTT received: timestamp: {ts}, voltage: {voltage}V, current: {current}A, power: {power}W, consume: {consume}mWh")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to parse MQTT message: {e} | payload: {payload}")
+        logger.info(f"📩 MQTT: {ts} | V={data[0] if len(data)>0 else None}V, A={data[1] if len(data)>1 else None}A, W={data[2] if len(data)>2 else None}W, mWh={data[3] if len(data)>3 else None}")
+    except Exception:
+        pass
 
-    # Append to cache CSV
     try:
         with open(RAW_CHECKPOINT_PATH, "a", encoding="utf-8") as f:
-            f.write(f'{ts},{msg.topic},"{payload.replace(chr(34)*2, chr(34))}"\n')
+            f.write(f'{ts},{msg.topic},"{payload}"\n')
     except Exception as e:
-        logger.error(f"❌ Could not write checkpoint log: {e}")
+        logger.error(f"❌ Failed to write checkpoint: {e}")
 
-
-# ─────────────────────────  CORE LOGIC  ────────────────────────────
+# ───────────── PIPELINE ─────────────
+## Filter
 def parse_and_filter(raw_rows):
-    """
-    raw_rows: list[dict] from MQTT queue
-    returns: pd.DataFrame ready for cleaning
-    """
-    parsed_rows = []
-
+    rows = []
     for r in raw_rows:
         try:
             payload = json.loads(r["payload"].replace('""', '"'))
-            if not isinstance(payload, dict):
-                continue
-            # keep only valid socket rows
-            if not r["topic"].startswith("device/socket/reply/"):
-                continue
+            if r["topic"].startswith("device/socket/reply/") and isinstance(payload.get("data", []), list):
+                v, a, w, c = (payload["data"] + [None]*4)[:4]
+                if any(x not in (0, None) for x in (a, w, c)):
+                    rows.append({
+                        "timestamp": r["timestamp"],
+                        "id": payload.get("id"),
+                        "imei": payload.get("imei"),
+                        "type": payload.get("type"),
+                        "voltage": float(v),
+                        "current": float(a),
+                        "power": float(w),
+                        "consume": float(c),
+                    })
+        except:
+            continue
+    return pd.DataFrame(rows)
 
-            data = payload.get("data", [])
-            if not (isinstance(data, list) and len(data) >= 4):
-                continue
-
-            voltage, current, power, consume = data[:4]
-            # drop idle frames where current, power, consume are 0 or None
-            if all(v in (0, None) for v in (current, power, consume)):
-                continue
-
-            parsed_rows.append(
-                {
-                    "timestamp": r["timestamp"],
-                    "id":        payload.get("id"),
-                    "imei":      payload.get("imei"),
-                    "type":      payload.get("type"),
-                    "voltage":   float(voltage),
-                    "current":   float(current),
-                    "power":     float(power),
-                    "consume":   float(consume),
-                }
-            )
-        except Exception as e:
-            logger.debug(f"⚠️ Skipping malformed payload: {e}")
-
-    return pd.DataFrame(parsed_rows)
-
-
-def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Detect >30 ± 2 s gaps; insert empty rows; impute/predict.
-    """
-    if df.empty:
-        return df
-
+## Detect and fill missing
+def fill_missing(df):
+    if df.empty: return df
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
+    df.sort_values("timestamp", inplace=True)
     expected = timedelta(seconds=EXPECTED_INTERVAL_SEC)
-    tol      = timedelta(seconds=TOLERANCE_SEC)
-
-    filled_rows   = [df.iloc[0]]
-    missing_count = 0
-
+    tol = timedelta(seconds=TOLERANCE_SEC)
+    rows = [df.iloc[0]]
     for i in range(1, len(df)):
-        prev, cur = df.iloc[i - 1]["timestamp"], df.iloc[i]["timestamp"]
-        delta     = cur - prev
-
-        filled_rows.append(df.iloc[i])
-
-        if delta > expected + tol:
-            gaps = int(round(delta / expected)) - 1
-            missing_count += gaps
-
-            for j in range(1, gaps + 1):
-                ts_gap = prev + j * expected
-                newrow = df.iloc[i - 1].copy()
-                newrow["timestamp"] = ts_gap
+        prev, curr = df.iloc[i-1]["timestamp"], df.iloc[i]["timestamp"]
+        rows.append(df.iloc[i])
+        if curr - prev > expected + tol:
+            for j in range(1, int(round((curr - prev) / expected))):
+                new_ts = prev + j * expected
+                gap_row = df.iloc[i-1].copy()
+                gap_row["timestamp"] = new_ts
                 for col in ["voltage", "current", "power", "consume"]:
-                    newrow[col] = np.nan
-                filled_rows.insert(-1, newrow)
+                    gap_row[col] = np.nan
+                rows.insert(-1, gap_row)
+    df = pd.DataFrame(rows).sort_values("timestamp")
+    df["consume_clean"] = df["consume"]
+    df.loc[(df["consume"] < 0) | (df["consume"].diff() < 0), "consume_clean"] = np.nan
 
-    df_full = pd.DataFrame(filled_rows).sort_values("timestamp").reset_index(drop=True)
-
-    # --- cleansing & model-based consume reconstruction -------------
-    feature_cols  = ["voltage", "current", "power"]
-    target_col    = "consume"
-
-    df_full["consume_clean"] = df_full[target_col]
-    diff = df_full["consume_clean"].diff()
-    df_full.loc[(df_full["consume_clean"] < 0) | (diff < 0), "consume_clean"] = np.nan
-
-    # KNN impute V, A, W
     imputer = KNNImputer(n_neighbors=3)
-    X_raw   = df_full[feature_cols]
-    X_filled= pd.DataFrame(imputer.fit_transform(X_raw), columns=feature_cols)
-    df_full[feature_cols] = X_filled
+    df[["voltage", "current", "power"]] = imputer.fit_transform(df[["voltage", "current", "power"]])
 
-    # predict missing consume via linear regression
-    train = df_full[df_full["consume_clean"].notna()]
-    pred  = df_full[df_full["consume_clean"].isna()]
-    if not pred.empty and not train.empty:
-        model = LinearRegression().fit(train[feature_cols], train["consume_clean"])
-        df_full.loc[pred.index, "consume_clean"] = model.predict(df_full.loc[pred.index, feature_cols])
+    train = df[df["consume_clean"].notna()]
+    pred = df[df["consume_clean"].isna()]
+    if not train.empty and not pred.empty:
+        model = LinearRegression().fit(train[["voltage", "current", "power"]], train["consume_clean"])
+        df.loc[pred.index, "consume_clean"] = model.predict(pred[["voltage", "current", "power"]])
+    df["consume"] = df["consume_clean"]
+    return df.drop(columns=["consume_clean"])
 
-    df_full[target_col] = df_full["consume_clean"]
-    df_full.drop(columns=["consume_clean"], inplace=True)
-
-    logger.info(f"✨ Clean batch: {len(df)} ➜ {len(df_full)} rows "
-                f"(filled {missing_count} gaps)")
-    return df_full
-
-
-def insert_mongo(df: pd.DataFrame):
-    """
-    Upsert cleaned docs into MongoDB.
-    """
-    if df.empty:
-        return
-
+## Final MongoDB Saver
+def insert_mongo(df):
+    if df.empty: return
     try:
-        client     = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        collection = client[MONGO_DB][MONGO_COL]
-
-        # ensure timestamp uniqueness to avoid duplicates
-        collection.create_index("timestamp", unique=True)
-
+        client = MongoClient(MONGO_URI)
+        col = client[MONGO_DB][MONGO_COL]
+        col.create_index("timestamp", unique=True)
         records = df.to_dict("records")
-        for rec in records:
-            rec["_id"] = rec["timestamp"]  # quick natural key
-        collection.bulk_write(
-            [pymongo.UpdateOne({"_id": r["_id"]}, {"$set": r}, upsert=True) for r in records],
-            ordered=False,
-        )
-        logger.info(f"📥 MongoDB: upserted {len(records)} docs")
-    except mongo_errors.BulkWriteError as bwe:
-        logger.debug("Duplicate records skipped")
+        for r in records: r["_id"] = r["timestamp"]
+        col.bulk_write([mongo_errors.UpdateOne({"_id": r["_id"]}, {"$set": r}, upsert=True) for r in records], ordered=False)
+        logger.info(f"📥 Inserted {len(records)} rows to MongoDB.")
     except Exception as e:
-        logger.error(f"❌ Mongo insert failed: {e}")
+        logger.error(f"❌ Mongo insert error: {e}")
 
-
+## Batch worker looper
 def batch_worker():
-    """
-    Every BATCH_SECONDS pull everything from queue, process, store.
-    """
     while not stop_event.is_set():
         time.sleep(BATCH_SECONDS)
-
         bundle = []
-        try:
-            while True:
-                bundle.append(queue_raw.get_nowait())
-        except Empty:
-            pass  # queue drained
-
+        while True:
+            try: bundle.append(queue_raw.get_nowait())
+            except Empty: break
         if not bundle:
-            logger.debug("⏱️ Batch tick – no new data")
+            logger.debug("⏱️ No new data this cycle")
             continue
-
-        df_parsed = parse_and_filter(bundle)
-        df_clean  = fill_missing(df_parsed)
+        df_clean = fill_missing(parse_and_filter(bundle))
         insert_mongo(df_clean)
 
+# ─────── FASTAPI ENDPOINTS ───────
+@app.get("/fetch")
+def fetch(Password: str):
+    if Password != FETCH_PASS:
+        raise HTTPException(status_code=401)
+    client = MongoClient(MONGO_URI)
+    data = list(client[MONGO_DB][MONGO_COL].find({}, {"_id": 0}))
+    return JSONResponse(data)
 
-# ─────────────────────────  RUNTIME  ───────────────────────────────
-def main():
-    # start batch thread
-    thr = threading.Thread(target=batch_worker, daemon=True)
-    thr.start()
+@app.get("/delete")
+def delete(Password: str):
+    if Password != FETCH_PASS:
+        raise HTTPException(status_code=401)
+    client = MongoClient(MONGO_URI)
+    count = client[MONGO_DB][MONGO_COL].delete_many({}).deleted_count
+    return {"message": f"🧨 Deleted {count} rows from MongoDB."}
 
-    # MQTT client in main thread
+@app.get("/load")
+def load(Password: str):
+    if Password != FETCH_PASS:
+        raise HTTPException(status_code=401)
+    client = MongoClient(MONGO_URI)
+    df = pd.DataFrame(list(client[MONGO_DB][MONGO_COL].find({}, {"_id": 0})))
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No data found.")
+    df.to_csv(EXPORT_CSV_PATH, index=False)
+    return FileResponse(EXPORT_CSV_PATH, filename="poptech_cleaned_data.csv", media_type="text/csv")
+
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
+
+# ─────── BOOTSTRAP ───────
+def mqtt_main():
+    threading.Thread(target=batch_worker, daemon=True).start()
     client = mqtt.Client()
     client.username_pw_set(USERNAME, PASSWORD)
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
-
-    # graceful SIGTERM/SIGINT (HF Space shutdown)
-    def handle_exit(signum, frame):
-        logger.info("🛑 Shutdown signal received")
-        stop_event.set()
-        client.disconnect()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, handle_exit)
-
-    # blocking loop
+    def handle_exit(sig, _): stop_event.set(); client.disconnect()
+    for s in [signal.SIGINT, signal.SIGTERM]: signal.signal(s, handle_exit)
     client.loop_forever()
 
+threading.Thread(target=mqtt_main, daemon=True).start()
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=7860)
