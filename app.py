@@ -31,7 +31,7 @@ MONGO_DB    = os.getenv("MONGO_DB", "poptech")
 MONGO_COL   = os.getenv("MONGO_COLLECTION", "device_clean")
 
 # Prediction and cleaning prefixes
-BATCH_SECONDS          = int(os.getenv("WINDOW_SECONDS", 3600))  # 1 h default
+BATCH_SECONDS          = int(os.getenv("WINDOW_SECONDS", 3600))      # 1 h default (suggesting ~15-30m on session saver on deployment stage)
 EXPECTED_INTERVAL_SEC  = int(os.getenv("EXPECTED_INTERVAL_SEC", 30))
 TOLERANCE_SEC          = int(os.getenv("TOLERANCE_SEC", 2))
 
@@ -66,15 +66,29 @@ def on_connect(client, userdata, flags, rc):
 
 
 def on_message(client, userdata, msg):
-    """Push raw line (timestamp, topic, payload) onto in-memory queue + optional CSV checkpoint"""
-    ts       = datetime.utcnow().isoformat()
-    payload  = msg.payload.decode(errors="replace")
+    """Push raw line (timestamp, topic, payload) onto in-memory queue + CSV checkpoint"""
+    ts = datetime.utcnow().isoformat()
+    payload = msg.payload.decode(errors="replace")
     row_dict = {"timestamp": ts, "topic": msg.topic, "payload": payload}
     queue_raw.put(row_dict)
 
-    # lightweight safety checkpoint (append-only CSV)
-    with open(RAW_CHECKPOINT_PATH, "a", encoding="utf-8") as f:
-        f.write(f'{ts},{msg.topic},"{payload.replace(chr(34)*2, chr(34))}"\n')
+    # Log every received message (even before parsing)
+    try:
+        data = json.loads(payload.replace('""', '"')).get("data", [])
+        voltage = data[0] if len(data) > 0 else None
+        current = data[1] if len(data) > 1 else None
+        power   = data[2] if len(data) > 2 else None
+        consume = data[3] if len(data) > 3 else None
+        logger.info(f"📩 MQTT received: timestamp: {ts}, voltage: {voltage}V, current: {current}A, power: {power}W, consume: {consume}mWh")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to parse MQTT message: {e} | payload: {payload}")
+
+    # Append to cache CSV
+    try:
+        with open(RAW_CHECKPOINT_PATH, "a", encoding="utf-8") as f:
+            f.write(f'{ts},{msg.topic},"{payload.replace(chr(34)*2, chr(34))}"\n')
+    except Exception as e:
+        logger.error(f"❌ Could not write checkpoint log: {e}")
 
 
 # ─────────────────────────  CORE LOGIC  ────────────────────────────
@@ -123,7 +137,7 @@ def parse_and_filter(raw_rows):
 
 def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Detect >40 ± 2 s gaps; insert empty rows; impute/predict.
+    Detect >30 ± 2 s gaps; insert empty rows; impute/predict.
     """
     if df.empty:
         return df
