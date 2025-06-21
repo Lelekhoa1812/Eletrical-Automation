@@ -175,6 +175,7 @@ def batch_worker():
 def fetch(Password: str):
     if Password != FETCH_PASS:
         raise HTTPException(status_code=401)
+    logger.info("✅ Fetch request received")
     client = MongoClient(MONGO_URI)
     data = list(client[MONGO_DB][MONGO_COL].find({}, {"_id": 0}))
     return JSONResponse(data)
@@ -185,6 +186,7 @@ def delete(Password: str):
         raise HTTPException(status_code=401)
     client = MongoClient(MONGO_URI)
     count = client[MONGO_DB][MONGO_COL].delete_many({}).deleted_count
+    logger.info("⚠️ Delete request received")
     return {"message": f"🧨 Deleted {count} rows from MongoDB."}
 
 @app.get("/load")
@@ -195,6 +197,7 @@ def load(Password: str):
     df = pd.DataFrame(list(client[MONGO_DB][MONGO_COL].find({}, {"_id": 0})))
     if df.empty:
         raise HTTPException(status_code=404, detail="No data found.")
+    logger.info("✅ Download request received")
     df.to_csv(EXPORT_CSV_PATH, index=False)
     return FileResponse(EXPORT_CSV_PATH, filename="poptech_cleaned_data.csv", media_type="text/csv")
 
