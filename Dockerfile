@@ -1,19 +1,22 @@
-# --------- PopTech real-time cleaning pipeline ---------
 FROM python:3.11-slim
 
-# 1. system deps for scikit-learn wheels
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential \
- && rm -rf /var/lib/apt/lists/*
+# Create and switch to non-root user
+RUN useradd -m -u 1000 user
+USER user
 
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Environment
+ENV HOME=/home/user
+WORKDIR $HOME/app
 
-# copy source late to leverage Docker layer caching
-COPY . .
+# Install Python deps
+COPY --chown=user requirements.txt .
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-# ensure logs appear instantly in HF Space dashboard
-ENV PYTHONUNBUFFERED=1
+# Create writable cache folders
+RUN mkdir -p $HOME/app/cache
 
+# Copy all source code
+COPY --chown=user . .
+
+# Run the app
 CMD ["python", "app.py"]
