@@ -18,21 +18,26 @@ from pymongo import MongoClient, errors as mongo_errors
 # ─────────────────────────  ENV / CONFIG  ──────────────────────────
 load_dotenv()  # reads .env in container root
 
+# Topic and APIs
 BROKER      = os.getenv("BROKER")
 PORT        = int(os.getenv("PORT", 1883))
 USERNAME    = os.getenv("USERNAME")
 PASSWORD    = os.getenv("PASSWORD")
 MQTT_TOPIC  = os.getenv("MQTT_TOPIC", "device/socket/reply/#")
 
+# Mongo string
 MONGO_URI   = os.getenv("MONGO_URI")
 MONGO_DB    = os.getenv("MONGO_DB", "poptech")
 MONGO_COL   = os.getenv("MONGO_COLLECTION", "device_clean")
 
+# Prediction and cleaning prefixes
 BATCH_SECONDS          = int(os.getenv("WINDOW_SECONDS", 3600))  # 1 h default
 EXPECTED_INTERVAL_SEC  = int(os.getenv("EXPECTED_INTERVAL_SEC", 30))
 TOLERANCE_SEC          = int(os.getenv("TOLERANCE_SEC", 2))
 
-RAW_CHECKPOINT_PATH    = os.getenv("RAW_CHECKPOINT_PATH", "checkpoint_raw.csv")
+# Write checkpoint file as cacheable
+RAW_CHECKPOINT_PATH = os.getenv("RAW_CHECKPOINT_PATH", "cache/checkpoint_raw.csv")
+os.makedirs(os.path.dirname(RAW_CHECKPOINT_PATH), exist_ok=True)
 
 # ─────────────────────────  LOGGING  ───────────────────────────────
 logging.basicConfig(
