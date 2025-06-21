@@ -213,11 +213,16 @@ def mqtt_main():
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
-    def handle_exit(sig, _): stop_event.set(); client.disconnect()
-    for s in [signal.SIGINT, signal.SIGTERM]: signal.signal(s, handle_exit)
     client.loop_forever()
 
-threading.Thread(target=mqtt_main, daemon=True).start()
-
 if __name__ == "__main__":
+    # Set signal handlers in main thread
+    def handle_exit(sig, _):
+        logger.info("🛑 Shutdown signal received")
+        stop_event.set()
+    for s in [signal.SIGINT, signal.SIGTERM]:
+        signal.signal(s, handle_exit)
+
+    threading.Thread(target=mqtt_main, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=7860)
+
