@@ -85,7 +85,7 @@ def on_message(client, userdata, msg):
         logger.error(f"❌ Failed to write checkpoint: {e}")
 
 # ───────────── PIPELINE ─────────────
-## Filter
+## Filter and parsing payload to 4 individual variables
 def parse_and_filter(raw_rows):
     rows = []
     for r in raw_rows:
@@ -130,19 +130,20 @@ def fill_missing(df):
     df = pd.DataFrame(rows).sort_values("timestamp")
     df["consume_clean"] = df["consume"]
     df.loc[(df["consume"] < 0) | (df["consume"].diff() < 0), "consume_clean"] = np.nan
-
+    # Using KNNImputer to fit missing target data using 3 other variables
     imputer = KNNImputer(n_neighbors=3)
     df[["voltage", "current", "power"]] = imputer.fit_transform(df[["voltage", "current", "power"]])
-
+    # Using LinearRegression to fit missing target data using 3 other variables
     train = df[df["consume_clean"].notna()]
     pred = df[df["consume_clean"].isna()]
     if not train.empty and not pred.empty:
         model = LinearRegression().fit(train[["voltage", "current", "power"]], train["consume_clean"])
         df.loc[pred.index, "consume_clean"] = model.predict(pred[["voltage", "current", "power"]])
     df["consume"] = df["consume_clean"]
+    logger.info("🧹 Handle missing function proceed")
     return df.drop(columns=["consume_clean"])
 
-## Final MongoDB Saver
+## MongoDB insertion 
 def insert_mongo(df):
     if df.empty: return
     try:
@@ -159,7 +160,7 @@ def insert_mongo(df):
     except Exception as e:
         logger.error(f"❌ Mongo insert error: {e}")
 
-## Batch worker looper
+## Batch worker to insert data to MongoDB
 def batch_worker():
     while not stop_event.is_set():
         time.sleep(BATCH_SECONDS)
@@ -210,6 +211,7 @@ def health():
 
 # ─────── BOOTSTRAP ───────
 def mqtt_main():
+    # MQTT broker ingestion
     threading.Thread(target=batch_worker, daemon=True).start()
     client = mqtt.Client()
     client.username_pw_set(USERNAME, PASSWORD)
@@ -218,6 +220,7 @@ def mqtt_main():
     client.connect(BROKER, PORT, 60)
     client.loop_forever()
 
+# Handle parallel threads
 if __name__ == "__main__":
     # Set signal handlers in main thread
     def handle_exit(sig, _):
@@ -225,7 +228,7 @@ if __name__ == "__main__":
         stop_event.set()
     for s in [signal.SIGINT, signal.SIGTERM]:
         signal.signal(s, handle_exit)
-
+    # Handle data ingestion from MQTT broker
     threading.Thread(target=mqtt_main, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=7860)
 
