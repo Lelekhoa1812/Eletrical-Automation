@@ -15,7 +15,7 @@ import pandas as pd
 import numpy as np
 from sklearn.impute import KNNImputer
 from sklearn.linear_model import LinearRegression
-from pymongo import MongoClient, errors as mongo_errors
+from pymongo import MongoClient, UpdateOne
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 import uvicorn
@@ -71,13 +71,13 @@ def on_message(client, userdata, msg):
     ts = datetime.utcnow().isoformat()
     payload = msg.payload.decode(errors="replace")
     queue_raw.put({"timestamp": ts, "topic": msg.topic, "payload": payload})
-
+    # Clean out spaces
     try:
         data = json.loads(payload.replace('""', '"')).get("data", [])
         logger.info(f"📩 MQTT: {ts} | V={data[0] if len(data)>0 else None}V, A={data[1] if len(data)>1 else None}A, W={data[2] if len(data)>2 else None}W, mWh={data[3] if len(data)>3 else None}")
     except Exception:
         pass
-
+    # Return as compact of ts, topic and payload at this stage
     try:
         with open(RAW_CHECKPOINT_PATH, "a", encoding="utf-8") as f:
             f.write(f'{ts},{msg.topic},"{payload}"\n')
@@ -151,7 +151,10 @@ def insert_mongo(df):
         col.create_index("timestamp", unique=True)
         records = df.to_dict("records")
         for r in records: r["_id"] = r["timestamp"]
-        col.bulk_write([mongo_errors.UpdateOne({"_id": r["_id"]}, {"$set": r}, upsert=True) for r in records], ordered=False)
+        operations = [
+                    UpdateOne({"_id": r["_id"]}, {"$set": r}, upsert=True) for r in records
+                ]
+        col.bulk_write(operations, ordered=False)
         logger.info(f"📥 Inserted {len(records)} rows to MongoDB.")
     except Exception as e:
         logger.error(f"❌ Mongo insert error: {e}")
