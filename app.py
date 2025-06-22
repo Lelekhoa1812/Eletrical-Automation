@@ -205,7 +205,7 @@ def batch_worker():
         if not bundle:
             logger.debug("⏱️ No new data this cycle")
             continue
-        logger.info("Start")
+        logger.info("Start cleaning 🧹")
         df_clean = fill_missing(parse_and_filter(bundle))
         insert_mongo(df_clean)
 
