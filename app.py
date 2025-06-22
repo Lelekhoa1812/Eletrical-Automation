@@ -112,70 +112,70 @@ def parse_and_filter(raw_rows):
 def fill_missing(df):
     if df.empty:
         return df
-    # Normalise values
+    # --- Chuẩn hoá thời gian ---
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df.sort_values("timestamp", inplace=True)
-    # Allowance
+    # Time interval limitation
     expected = timedelta(seconds=EXPECTED_INTERVAL_SEC)
     tol = timedelta(seconds=TOLERANCE_SEC)
-    # B1: phát hiện và chèn các dòng bị thiếu timestamp
+    # --- B1. Chèn bản ghi bị rơi ---
     rows = [df.iloc[0]]
     for i in range(1, len(df)):
         prev, curr = df.iloc[i - 1]["timestamp"], df.iloc[i]["timestamp"]
         rows.append(df.iloc[i])
         if curr - prev > expected + tol:
             for j in range(1, int(round((curr - prev) / expected))):
-                new_ts = prev + j * expected
-                gap_row = df.iloc[i - 1].copy()
-                gap_row["timestamp"] = new_ts
+                gap_ts = prev + j * expected
+                gap = df.iloc[i - 1].copy()
+                gap["timestamp"] = gap_ts
                 for col in ["voltage", "current", "power", "consume"]:
-                    gap_row[col] = np.nan
-                rows.insert(-1, gap_row)
-    # Flag and clean
-    df = pd.DataFrame(rows).sort_values("timestamp")
+                    gap[col] = np.nan
+                rows.insert(-1, gap)
+    # Sorting with ts to be identifier
+    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
     df["consume_clean"] = df["consume"]
-    # B2: loại bỏ giá trị bất thường
     df.loc[(df["consume"] < 0) | (df["consume"].diff() < 0), "consume_clean"] = np.nan
-    # B3: nội suy input features bằng KNN
+    # --- B2. Impute feature ---
     imputer = KNNImputer(n_neighbors=3)
-    df[["voltage", "current", "power"]] = imputer.fit_transform(df[["voltage", "current", "power"]])
-    # B4: mô hình chính sử dụng 3 input đầu vào
+    df[["voltage", "current", "power"]] = imputer.fit_transform(
+        df[["voltage", "current", "power"]]
+    )
+    # --- B3. Model chính ---
     train = df[df["consume_clean"].notna()]
-    pred = df[df["consume_clean"].isna()]
+    pred  = df[df["consume_clean"].isna()]
+    # NaN and null not valid
     if not train.empty and not pred.empty:
-        model = LinearRegression()
-        model.fit(train[["voltage", "current", "power"]], train["consume_clean"])
+        model = LinearRegression().fit(
+            train[["voltage", "current", "power"]],
+            train["consume_clean"]
+        )
         try:
-            df.loc[pred.index, "consume_clean"] = model.predict(pred[["voltage", "current", "power"]])
-        except ValueError as e:
-            logger.warning(f"⚠️ LinearRegression prediction failed on part of data: {e}")
-    # B5: fallback dự đoán theo timestamp nếu vẫn còn thiếu
+            y_hat = model.predict(pred[["voltage", "current", "power"]])
+            # Khớp index bằng Series (an toàn với duplicate)
+            df.loc[pred.index, "consume_clean"] = pd.Series(y_hat, index=pred.index)
+        except Exception as e:
+            logger.warning(f"⚠️ Primary model failed partially: {e}")
+    # --- B4. Fallback theo timestamp ---
     still_missing = df[df["consume_clean"].isna()]
     if not still_missing.empty:
-        logger.warning(f"⚠️ {len(still_missing)} rows still missing consume after model prediction. Using timestamp fallback.")
-        # Total second computation (temp variable)
+        logger.warning(f"⚠️ {len(still_missing)} rows still missing. Using timestamp fallback.")
         df["ts_sec"] = (df["timestamp"] - df["timestamp"].min()).dt.total_seconds()
-        # Can't be NaN to be trainable
-        fallback_train = df[df["consume_clean"].notna()]
-        fallback_pred = df[df["consume_clean"].isna()]
-        # Rm NaN in timestamp fallback
-        fallback_pred_valid = fallback_pred[fallback_pred["ts_sec"].notna()]
-        # Not null -> render model
-        if not fallback_train.empty and not fallback_pred_valid.empty:
-            fallback_model = LinearRegression()
-            fallback_model.fit(fallback_train[["ts_sec"]], fallback_train["consume_clean"])
-            y_fallback_pred = fallback_model.predict(fallback_pred_valid[["ts_sec"]])
-            if len(y_fallback_pred) == len(fallback_pred_valid):
-                df.loc[fallback_pred_valid.index, "consume_clean"] = y_fallback_pred
-            else:
-                logger.warning("⚠️ Fallback prediction length mismatch, skipping assignment.")
-        # Drop ts_sec (temp variable)
+        fb_train = df[df["consume_clean"].notna()]
+        fb_pred  = df[df["consume_clean"].isna()]
+        # Chỉ lấy bản ghi có ts_sec hợp lệ & index duy nhất
+        fb_pred = fb_pred[fb_pred["ts_sec"].notna()].drop_duplicates(subset="timestamp")
+        if not fb_train.empty and not fb_pred.empty:
+            fb_model = LinearRegression().fit(
+                fb_train[["ts_sec"]], fb_train["consume_clean"]
+            )
+            y_fb = fb_model.predict(fb_pred[["ts_sec"]])
+            df.loc[fb_pred.index, "consume_clean"] = pd.Series(y_fb, index=fb_pred.index)
+        # Drop total sec temp var
         df.drop(columns=["ts_sec"], inplace=True)
-    # B6: cập nhật kết quả cuối cùng
+    # --- Kết quả cuối ---
     df["consume"] = df["consume_clean"]
-    logger.info("🧹 Handle missing function proceed")
+    logger.info("🧹 fill_missing() hoàn tất làm sạch & khôi phục.")
     return df.drop(columns=["consume_clean"])
-
 
 ## MongoDB insertion 
 def insert_mongo(df):
@@ -190,7 +190,7 @@ def insert_mongo(df):
                     UpdateOne({"_id": r["_id"]}, {"$set": r}, upsert=True) for r in records
                 ]
         col.bulk_write(operations, ordered=False)
-        logger.info(f"📥 Inserted {len(records)} rows to MongoDB.")
+        logger.info(f"🪣 Inserted {len(records)} rows to MongoDB.")
     except Exception as e:
         logger.error(f"❌ Mongo insert error: {e}")
 
@@ -205,6 +205,7 @@ def batch_worker():
         if not bundle:
             logger.debug("⏱️ No new data this cycle")
             continue
+        logger.info("Start")
         df_clean = fill_missing(parse_and_filter(bundle))
         insert_mongo(df_clean)
 
