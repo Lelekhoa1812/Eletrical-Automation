@@ -110,38 +110,66 @@ def parse_and_filter(raw_rows):
 
 ## Detect and fill missing
 def fill_missing(df):
-    if df.empty: return df
+    if df.empty:
+        return df
+    # Normalise values
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df.sort_values("timestamp", inplace=True)
+    # Allowance
     expected = timedelta(seconds=EXPECTED_INTERVAL_SEC)
     tol = timedelta(seconds=TOLERANCE_SEC)
+    # B1: phát hiện và chèn các dòng bị thiếu timestamp
     rows = [df.iloc[0]]
     for i in range(1, len(df)):
-        prev, curr = df.iloc[i-1]["timestamp"], df.iloc[i]["timestamp"]
+        prev, curr = df.iloc[i - 1]["timestamp"], df.iloc[i]["timestamp"]
         rows.append(df.iloc[i])
         if curr - prev > expected + tol:
             for j in range(1, int(round((curr - prev) / expected))):
                 new_ts = prev + j * expected
-                gap_row = df.iloc[i-1].copy()
+                gap_row = df.iloc[i - 1].copy()
                 gap_row["timestamp"] = new_ts
                 for col in ["voltage", "current", "power", "consume"]:
                     gap_row[col] = np.nan
                 rows.insert(-1, gap_row)
+    # Flag and clean
     df = pd.DataFrame(rows).sort_values("timestamp")
     df["consume_clean"] = df["consume"]
+    # B2: loại bỏ giá trị bất thường
     df.loc[(df["consume"] < 0) | (df["consume"].diff() < 0), "consume_clean"] = np.nan
-    # Using KNNImputer to fit missing target data using 3 other variables
+    # B3: nội suy input features bằng KNN
     imputer = KNNImputer(n_neighbors=3)
     df[["voltage", "current", "power"]] = imputer.fit_transform(df[["voltage", "current", "power"]])
-    # Using LinearRegression to fit missing target data using 3 other variables
+    # B4: mô hình chính sử dụng 3 input đầu vào
     train = df[df["consume_clean"].notna()]
     pred = df[df["consume_clean"].isna()]
     if not train.empty and not pred.empty:
-        model = LinearRegression().fit(train[["voltage", "current", "power"]], train["consume_clean"])
-        df.loc[pred.index, "consume_clean"] = model.predict(pred[["voltage", "current", "power"]])
+        model = LinearRegression()
+        model.fit(train[["voltage", "current", "power"]], train["consume_clean"])
+        try:
+            df.loc[pred.index, "consume_clean"] = model.predict(pred[["voltage", "current", "power"]])
+        except ValueError as e:
+            logger.warning(f"⚠️ LinearRegression prediction failed on part of data: {e}")
+    # B5: fallback dự đoán theo timestamp nếu vẫn còn thiếu
+    still_missing = df[df["consume_clean"].isna()]
+    if not still_missing.empty:
+        logger.warning(f"⚠️ {len(still_missing)} rows still missing consume after model prediction. Using timestamp fallback.")
+        # Total time (ts_sec)
+        df["ts_sec"] = (df["timestamp"] - df["timestamp"].min()).dt.total_seconds()
+        # Normalize
+        fallback_train = df[df["consume_clean"].notna()]
+        fallback_pred = df[df["consume_clean"].isna()]
+        # Fallback
+        if not fallback_train.empty and not fallback_pred.empty:
+            fallback_model = LinearRegression()
+            fallback_model.fit(fallback_train[["ts_sec"]], fallback_train["consume_clean"])
+            df.loc[fallback_pred.index, "consume_clean"] = fallback_model.predict(fallback_pred[["ts_sec"]])
+        # Drop ts_sec
+        df.drop(columns=["ts_sec"], inplace=True)
+    # B6: cập nhật kết quả cuối cùng
     df["consume"] = df["consume_clean"]
     logger.info("🧹 Handle missing function proceed")
     return df.drop(columns=["consume_clean"])
+
 
 ## MongoDB insertion 
 def insert_mongo(df):
