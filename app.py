@@ -36,7 +36,7 @@ FETCH_PASS   = os.getenv("FETCH_PASSWORD")
 
 BATCH_SECONDS = int(os.getenv("WINDOW_SECONDS", 1800))
 EXPECTED_INTERVAL_SEC = int(os.getenv("EXPECTED_INTERVAL_SEC", 30))
-TOLERANCE_SEC = int(os.getenv("TOLERANCE_SEC", 2))
+TOLERANCE_SEC = int(os.getenv("TOLERANCE_SEC", 10))
 RAW_CHECKPOINT_PATH = os.getenv("RAW_CHECKPOINT_PATH", "cache/checkpoint_raw.csv")
 EXPORT_CSV_PATH = "mongo_cleaned_export.csv"
 
@@ -153,17 +153,23 @@ def fill_missing(df):
     still_missing = df[df["consume_clean"].isna()]
     if not still_missing.empty:
         logger.warning(f"⚠️ {len(still_missing)} rows still missing consume after model prediction. Using timestamp fallback.")
-        # Total time (ts_sec)
+        # Total second computation (temp variable)
         df["ts_sec"] = (df["timestamp"] - df["timestamp"].min()).dt.total_seconds()
-        # Normalize
+        # Can't be NaN to be trainable
         fallback_train = df[df["consume_clean"].notna()]
         fallback_pred = df[df["consume_clean"].isna()]
-        # Fallback
-        if not fallback_train.empty and not fallback_pred.empty:
+        # Rm NaN in timestamp fallback
+        fallback_pred_valid = fallback_pred[fallback_pred["ts_sec"].notna()]
+        # Not null -> render model
+        if not fallback_train.empty and not fallback_pred_valid.empty:
             fallback_model = LinearRegression()
             fallback_model.fit(fallback_train[["ts_sec"]], fallback_train["consume_clean"])
-            df.loc[fallback_pred.index, "consume_clean"] = fallback_model.predict(fallback_pred[["ts_sec"]])
-        # Drop ts_sec
+            y_fallback_pred = fallback_model.predict(fallback_pred_valid[["ts_sec"]])
+            if len(y_fallback_pred) == len(fallback_pred_valid):
+                df.loc[fallback_pred_valid.index, "consume_clean"] = y_fallback_pred
+            else:
+                logger.warning("⚠️ Fallback prediction length mismatch, skipping assignment.")
+        # Drop ts_sec (temp variable)
         df.drop(columns=["ts_sec"], inplace=True)
     # B6: cập nhật kết quả cuối cùng
     df["consume"] = df["consume_clean"]
