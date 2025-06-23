@@ -7,7 +7,7 @@
 
 import os, json, signal, logging, threading, time
 from datetime import datetime, timedelta
-from queue import Queue, Empty
+from collections import deque 
 
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
@@ -34,180 +34,186 @@ MONGO_DB     = os.getenv("MONGO_DB", "poptech")
 MONGO_COL    = os.getenv("MONGO_COLLECTION", "device_clean")
 FETCH_PASS   = os.getenv("FETCH_PASSWORD")
 
-BATCH_SECONDS = int(os.getenv("WINDOW_SECONDS", 1800))
+# Tham số xử lý (thời gian)
 EXPECTED_INTERVAL_SEC = int(os.getenv("EXPECTED_INTERVAL_SEC", 30))
-TOLERANCE_SEC = int(os.getenv("TOLERANCE_SEC", 10))
-RAW_CHECKPOINT_PATH = os.getenv("RAW_CHECKPOINT_PATH", "cache/checkpoint_raw.csv")
-EXPORT_CSV_PATH = "mongo_cleaned_export.csv"
+TOLERANCE_SEC         = int(os.getenv("TOLERANCE_SEC", 10))
+BUFFER_SECONDS        = int(os.getenv("BUFFER_SECONDS", 4 * 3600))   # 4 giờ
+BACKFILL_INTERVAL     = int(os.getenv("BACKFILL_INTERVAL", 10))      # 10 giây
 
+RAW_CHECKPOINT_PATH   = os.getenv("RAW_CHECKPOINT_PATH", "cache/checkpoint_raw.csv")
+EXPORT_CSV_PATH       = "mongo_cleaned_export.csv"
 os.makedirs(os.path.dirname(RAW_CHECKPOINT_PATH), exist_ok=True)
 
-# ─────── LOGGING ───────
+# ─────────────── LOGGING ───────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     force=True
 )
 logger = logging.getLogger("poptech-cleaner")
-for m in ["pymongo", "pymongo.server_selection", "pymongo.topology", "pymongo.connection"]:
-    logging.getLogger(m).setLevel(logging.WARNING)
-logger.info("🚀 PopTech FastAPI Cleaning Server starting...")
 
-# ──────────── GLOBALS ─────────────────
-queue_raw = Queue()
-stop_event = threading.Event()
-app = FastAPI()
+# ─────────────── GLOBALS ───────────────
+win_len      = BUFFER_SECONDS // EXPECTED_INTERVAL_SEC + 200
+window       = deque(maxlen=win_len)           # lưu 4 giờ gần nhất
+stop_event   = threading.Event()
+app          = FastAPI()
 
-# ─────────── MQTT CALLBACKS ───────────
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        logger.info("✅ Connected to MQTT broker")
-        client.subscribe(MQTT_TOPIC)
-    else:
-        logger.error(f"❌ MQTT connection failed: {rc}")
+# ─────────────── UTILITIES ───────────────
+# Đảm bảo giá trị là float, nếu không flag NaN
+def safe_float(x):
+    try: return float(x)
+    except: return np.nan
 
-# ─ DEBUG MESSENGER & CHECKPOINT WRITER ─
-def on_message(client, userdata, msg):
-    ts = datetime.utcnow().isoformat()
-    payload = msg.payload.decode(errors="replace")
-    queue_raw.put({"timestamp": ts, "topic": msg.topic, "payload": payload})
-    # Clean out spaces
+def parse_row(ts: str, topic: str, payload: str):
+    """Trả về dict đã parse hoặc None nếu không hợp lệ."""
     try:
-        data = json.loads(payload.replace('""', '"')).get("data", [])
-        logger.info(f"📩 MQTT: {ts} | V={data[0] if len(data)>0 else None}V, A={data[1] if len(data)>1 else None}A, W={data[2] if len(data)>2 else None}W, mWh={data[3] if len(data)>3 else None}")
+        j = json.loads(payload.replace('""', '"'))
+        if not topic.startswith("device/socket/reply/"):
+            return None
+        if not isinstance(j.get("data", []), list):
+            return None
+        v, a, w, c = (j["data"] + [None] * 4)[:4]
+        # bỏ frame idle (all 0)
+        if all(x in (0, None) for x in (a, w, c)):
+            return None
+        return {
+            "timestamp": ts,
+            "id": j.get("id"),
+            "imei": j.get("imei"),
+            "type": j.get("type"),
+            "voltage": safe_float(v),
+            "current": safe_float(a),
+            "power": safe_float(w),
+            "consume": safe_float(c)
+        }
     except Exception:
-        pass
-    # Return as compact of ts, topic and payload at this stage
+        return None
+
+# Tải dữ liệu mới lên DB
+def upsert_mongo(docs):
+    if not docs:
+        return
     try:
-        with open(RAW_CHECKPOINT_PATH, "a", encoding="utf-8") as f:
-            f.write(f'{ts},{msg.topic},"{payload}"\n')
+        client = MongoClient(MONGO_URI)
+        col    = client[MONGO_DB][MONGO_COL]
+        col.create_index("timestamp", unique=True)
+        ops = [UpdateOne({"_id": d["timestamp"]}, {"$set": d}, upsert=True) for d in docs]
+        col.bulk_write(ops, ordered=False)
     except Exception as e:
-        logger.error(f"❌ Failed to write checkpoint: {e}")
+        logger.error(f"❌ Mongo error: {e}")
 
-# ───────────── PIPELINE ─────────────
-## Filter and parsing payload to 4 individual variables
-def parse_and_filter(raw_rows):
-    rows = []
-    for r in raw_rows:
-        try:
-            payload = json.loads(r["payload"].replace('""', '"'))
-            if r["topic"].startswith("device/socket/reply/") and isinstance(payload.get("data", []), list):
-                v, a, w, c = (payload["data"] + [None]*4)[:4]
-                if any(x not in (0, None) for x in (a, w, c)):
-                    rows.append({
-                        "timestamp": r["timestamp"],
-                        "id": payload.get("id"),
-                        "imei": payload.get("imei"),
-                        "type": payload.get("type"),
-                        "voltage": float(v),
-                        "current": float(a),
-                        "power": float(w),
-                        "consume": float(c),
-                    })
-        except:
-            continue
-    return pd.DataFrame(rows)
-
-## Detect and fill missing
-def fill_missing(df):
+# Chèn giá trị tổng thể
+def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    # --- Chuẩn hoá thời gian ---
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df.sort_values("timestamp", inplace=True)
-    # Time interval limitation
+    # Tổng thời gian dự kiến giữa session
     expected = timedelta(seconds=EXPECTED_INTERVAL_SEC)
-    tol = timedelta(seconds=TOLERANCE_SEC)
-    # --- B1. Chèn bản ghi bị rơi ---
+    tol      = timedelta(seconds=TOLERANCE_SEC)
+    # Lọc lỗi và trống
     rows = [df.iloc[0]]
     for i in range(1, len(df)):
-        prev, curr = df.iloc[i - 1]["timestamp"], df.iloc[i]["timestamp"]
+        prev, curr = df.iloc[i-1]["timestamp"], df.iloc[i]["timestamp"]
         rows.append(df.iloc[i])
         if curr - prev > expected + tol:
             for j in range(1, int(round((curr - prev) / expected))):
                 gap_ts = prev + j * expected
-                gap = df.iloc[i - 1].copy()
+                gap = df.iloc[i-1].copy()
                 gap["timestamp"] = gap_ts
                 for col in ["voltage", "current", "power", "consume"]:
                     gap[col] = np.nan
                 rows.insert(-1, gap)
-    # Sorting with ts to be identifier
+    # Sort với ts là identifier
     df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
     df["consume_clean"] = df["consume"]
     df.loc[(df["consume"] < 0) | (df["consume"].diff() < 0), "consume_clean"] = np.nan
-    # --- B2. Impute feature ---
-    imputer = KNNImputer(n_neighbors=3)
-    df[["voltage", "current", "power"]] = imputer.fit_transform(
-        df[["voltage", "current", "power"]]
-    )
-    # --- B3. Model chính ---
+    # Impute 3 giá trị còn lại với KNNImputer
+    non_missing = df[["voltage","current","power"]].dropna().shape[0]
+    k = min(3, max(1, non_missing))
+    imputer = KNNImputer(n_neighbors=k)
+    df[["voltage", "current", "power"]] = imputer.fit_transform(df[["voltage", "current", "power"]])
+    # Train và pred fit với LinearRegression
     train = df[df["consume_clean"].notna()]
     pred  = df[df["consume_clean"].isna()]
-    # NaN and null not valid
     if not train.empty and not pred.empty:
-        model = LinearRegression().fit(
-            train[["voltage", "current", "power"]],
-            train["consume_clean"]
-        )
+        model = LinearRegression().fit(train[["voltage","current","power"]], train["consume_clean"])
         try:
-            y_hat = model.predict(pred[["voltage", "current", "power"]])
-            # Khớp index bằng Series (an toàn với duplicate)
+            y_hat = model.predict(pred[["voltage","current","power"]])
             df.loc[pred.index, "consume_clean"] = pd.Series(y_hat, index=pred.index)
         except Exception as e:
-            logger.warning(f"⚠️ Primary model failed partially: {e}")
-    # --- B4. Fallback theo timestamp ---
-    still_missing = df[df["consume_clean"].isna()]
-    if not still_missing.empty:
-        logger.warning(f"⚠️ {len(still_missing)} rows still missing. Using timestamp fallback.")
+            logger.warning(f"⚠️ Primary model error: {e}")
+    # Nếu còn giá trị trống sau bộ lọc đầu, tái sd LinearRegression và dự đoán trên ts + tổng tg giữa session
+    still = df[df["consume_clean"].isna()]
+    if not still.empty:
+        logger.warning(f"⚠️ {len(still)} rows still missing → timestamp fallback")
         df["ts_sec"] = (df["timestamp"] - df["timestamp"].min()).dt.total_seconds()
         fb_train = df[df["consume_clean"].notna()]
         fb_pred  = df[df["consume_clean"].isna()]
-        # Chỉ lấy bản ghi có ts_sec hợp lệ & index duy nhất
-        fb_pred = fb_pred[fb_pred["ts_sec"].notna()].drop_duplicates(subset="timestamp")
+        fb_pred  = fb_pred[fb_pred["ts_sec"].notna()].drop_duplicates(subset="timestamp")
         if not fb_train.empty and not fb_pred.empty:
-            fb_model = LinearRegression().fit(
-                fb_train[["ts_sec"]], fb_train["consume_clean"]
-            )
+            fb_model = LinearRegression().fit(fb_train[["ts_sec"]], fb_train["consume_clean"])
             y_fb = fb_model.predict(fb_pred[["ts_sec"]])
             df.loc[fb_pred.index, "consume_clean"] = pd.Series(y_fb, index=fb_pred.index)
-        # Drop total sec temp var
         df.drop(columns=["ts_sec"], inplace=True)
-    # --- Kết quả cuối ---
+    # Giá trị cuối và thải giá trị thừa
     df["consume"] = df["consume_clean"]
-    logger.info("🧹 fill_missing() hoàn tất làm sạch & khôi phục.")
+    # Đánh dấu những bản ghi vẫn còn thiếu consume
+    # Khi hàm trả về, mỗi dòng sẽ có need_backfill = True/False.
+    df.loc[:, "need_backfill"] = df["consume"].isna()
     return df.drop(columns=["consume_clean"])
 
-## MongoDB insertion 
-def insert_mongo(df):
-    if df.empty: return
-    try:
-        client = MongoClient(MONGO_URI)
-        col = client[MONGO_DB][MONGO_COL]
-        col.create_index("timestamp", unique=True)
-        records = df.to_dict("records")
-        for r in records: r["_id"] = r["timestamp"]
-        operations = [
-                    UpdateOne({"_id": r["_id"]}, {"$set": r}, upsert=True) for r in records
-                ]
-        col.bulk_write(operations, ordered=False)
-        logger.info(f"🪣 Inserted {len(records)} rows to MongoDB.")
-    except Exception as e:
-        logger.error(f"❌ Mongo insert error: {e}")
+# ───────────── MQTT CALLBACKS ─────────────
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        logger.info("✅ MQTT connected")
+        client.subscribe(MQTT_TOPIC)
+    else:
+        logger.error(f"❌ MQTT connect failed: {rc}")
 
-## Batch worker to insert data to MongoDB
-def batch_worker():
+# Pipe chính và debug
+def on_message(client, userdata, msg):
+    ts = datetime.utcnow().isoformat()
+    payload = msg.payload.decode(errors="replace")
+    with open(RAW_CHECKPOINT_PATH,"a",encoding="utf-8") as f:
+        f.write(f"{ts},{msg.topic},\"{payload}\"\n")
+    row = parse_row(ts,msg.topic,payload)
+    if row is None: return
+    # Ghép vào cửa sổ và fill ngay
+    df_win = pd.DataFrame(window)
+    df_new = pd.concat([df_win, pd.DataFrame([row])], ignore_index=True)
+    df_filled = fill_missing(df_new.tail(2))  # chỉ cần bản ghi trước & mới
+    row_clean = df_filled.tail(1).to_dict("records")[0]
+    row_clean["need_backfill"] = pd.isna(row_clean["consume"])
+    # Gắn giá trị clean vào window session
+    window.append(row_clean)
+    upsert_mongo([row_clean])
+    logger.info(f"📥 Stored row {row_clean['timestamp']}")
+
+# ───────────── BACK-FILL WORKER ─────────────
+def backfill_worker():
     while not stop_event.is_set():
-        time.sleep(BATCH_SECONDS)
-        bundle = []
-        while True:
-            try: bundle.append(queue_raw.get_nowait())
-            except Empty: break
-        if not bundle:
-            logger.debug("⏱️ No new data this cycle")
+        time.sleep(BACKFILL_INTERVAL)
+        df_win = pd.DataFrame(window)
+        pending_mask = df_win["need_backfill"]
+        if not pending_mask.any():
             continue
-        logger.info("Start cleaning 🧹")
-        df_clean = fill_missing(parse_and_filter(bundle))
-        insert_mongo(df_clean)
+        idxs = df_win[pending_mask].index
+        cols = ["voltage", "current", "power"]
+        imputer = KNNImputer(n_neighbors=3)
+        df_win[cols] = imputer.fit_transform(df_win[cols])
+        train = df_win[~pending_mask]
+        if train.empty:
+            continue
+        model = LinearRegression().fit(train[cols], train["consume"])
+        df_win.loc[idxs, "consume"] = model.predict(df_win.loc[idxs, cols])
+        df_win.loc[idxs, "need_backfill"] = False
+        # update deque
+        for i in idxs:
+            window[i].update(df_win.loc[i].to_dict())
+        # Upload and merge current on Mongo
+        upsert_mongo([window[i] for i in idxs])
+        logger.info(f"🔄 Back-filled {len(idxs)} rows")
 
 # ─────── FASTAPI ENDPOINTS ───────
 @app.get("/fetch")
@@ -246,8 +252,6 @@ def health():
 
 # ─────── BOOTSTRAP ───────
 def mqtt_main():
-    # MQTT broker ingestion
-    threading.Thread(target=batch_worker, daemon=True).start()
     client = mqtt.Client()
     client.username_pw_set(USERNAME, PASSWORD)
     client.on_connect = on_connect
@@ -263,7 +267,8 @@ if __name__ == "__main__":
         stop_event.set()
     for s in [signal.SIGINT, signal.SIGTERM]:
         signal.signal(s, handle_exit)
-    # Handle data ingestion from MQTT broker
+    # Handle data ingestion from MQTT broker, and backfiller
+    threading.Thread(target=backfill_worker, daemon=True).start()   # quét back-fill 10s/lần
     threading.Thread(target=mqtt_main, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=7860)
 
